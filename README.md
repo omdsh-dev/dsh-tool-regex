@@ -10,13 +10,14 @@ DSH 正则工具插件 —— 测试匹配、提取捕获组、安全替换、**
 
 本插件提供确定性正则工具，其中 `explain` 是差异化能力：静态解析 pattern 结构并给出人读解释，**不执行匹配**，天然免疫 ReDoS。
 
-## 安全模型（ReDoS 三层防线）
+## 安全模型（ReDoS 多层防线）
 
 JS 正则的灾难性回溯是真实威胁（如 `(a+)+$` 配合超长输入）。防线：
 
-1. **输入长度上限**：64,000 字节（UTF-8）——正则复杂度指数级时，长度上限是唯一可靠防线；超限在入口直接拒绝，不进入回溯
-2. **执行时间预算**：`timeoutMs: 1000`——dsh 工具管道超时取消，模型回合不会卡死
-3. **explain 零执行**：只做静态 tokenizer，不构造 `RegExp` 实例，任何 pattern 都即时返回
+1. **worker 硬超时**：test/find/replace 在**可终止的 worker 线程**内同步执行，1,000ms 预算到期 `worker.terminate()` 并返回 `regex: execution timed out`——灾难性回溯不再能阻塞宿主进程（工具管道的 `timeoutMs` 对同步阻塞体是协作式，仅靠它不够；worker 内会再次执行全部上限校验）
+2. **输入长度上限**：64,000 字节（UTF-8）——超限在入口直接拒绝，不进入回溯
+3. **资源上限**：pattern ≤ 16KB、replacement ≤ 16KB、输出 ≤ 1MB、匹配数 ≤ 1,000（limit 钳制）
+4. **explain 零执行**：只做静态 tokenizer，不构造 `RegExp` 实例，任何 pattern 都即时返回
 
 > ⚠️ 工具描述与 README 均明确警告模型：**不要对不可信的大输入使用无锚点的嵌套量词 pattern**（如 `(a+)+`、`(.*)*`）。
 
@@ -29,26 +30,26 @@ JS 正则的灾难性回溯是真实威胁（如 `(a+)+$` 配合超长输入）�
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `action` | string | ✅ | `test` / `find` / `replace` / `explain` |
-| `pattern` | string | ✅ | 正则（JavaScript 语法，**不含**外围 `/`） |
-| `input` | string | | 待匹配文本（test/find/replace 必需） |
+| `pattern` | string | ✅ | 正则（JavaScript 语法，**不含**外围 `/`）；≤ 16KB |
+| `input` | string | | 待匹配文本（test/find/replace 必需）；≤ 64KB |
 | `flags` | string | | 如 `"gi"`；支持 `g i m s u y d v`，需唯一且合法 |
-| `replacement` | string | | replace 的替换文本，支持 `$1`/`$2`/`$<name>`/`$$` |
-| `limit` | integer | | find 最大报告匹配数，默认 50 |
+| `replacement` | string | | replace 的替换文本，支持 `$1`/`$2`/`$<name>`/`$$`；≤ 16KB |
+| `limit` | integer | | find 最大报告匹配数，默认 50，**上限 1,000** |
 
 ## Actions
 
 | action | 功能 | 输出示例 |
 |---|---|---|
 | `test` | 判断是否匹配（整串语义由模型自行用 `^...$` 表达） | `{"matched":true}` |
-| `find` | 全部匹配：index / 完整匹配 / 命名与编号捕获组（**无 `g` 自动补 `g`**） | `[{"index":0,"match":"a@b","groups":{"name":"a"}}]` |
+| `find` | 全部匹配：index / 完整匹配 / **编号捕获组 `captures`** / 命名组 `groups`（**无 `g` 自动补 `g`**） | `[{"index":0,"match":"a@b","captures":["a","b"],"groups":{"name":"a"}}]` |
 | `replace` | 全局安全替换（`$1`/`$<name>`/`$$`），返回结果与替换次数 | `{"result":"world hello","replaced":1}` |
-| `explain` | 静态解析 pattern → 人读节点序列（不执行匹配） | `[{"kind":"escape","text":"\\d","meaning":"A digit [0-9]"}]` |
+| `explain` | 静态解析 pattern → 人读节点序列（不执行匹配；节点数 ≤ 4,096） | `[{"kind":"escape","text":"\\d","meaning":"A digit [0-9]"}]` |
 
 ## 示例
 
 ```
 regex { action: "find", pattern: "(\\w+)@(\\w+)", input: "a@b x c@d" }
-  → [{"index":0,"match":"a@b","groups":null},{"index":6,"match":"c@d","groups":null}]
+  → [{"index":0,"match":"a@b","captures":["a","b"],"groups":null},{"index":6,"match":"c@d","captures":["c","d"],"groups":null}]
 
 regex { action: "replace", pattern: "(\\w+) (\\w+)", input: "hello world", replacement: "$2 $1" }
   → {"result":"world hello","replaced":1}
@@ -63,10 +64,14 @@ regex { action: "explain", pattern: "\\d{4}-\\d{2}" }
 |---|---|
 | 无效 pattern | `regex: invalid pattern: <SyntaxError 信息（含位置）>`，不崩溃 |
 | 无效 flag / 重复 flag | `regex: invalid flag "q"` / `regex: duplicate flag "g"` |
-| 空 pattern | 合法（匹配空串） |
-| 命名组 | find 输出 `groups: {name: value}`；replace 支持 `$<name>` |
+| 空 pattern | 合法（匹配空串）；`u`/`v` 下空匹配按 code point 推进（surrogate pair 不会重复命中） |
+| ReDoS（病理 pattern） | worker 硬超时：`regex: execution timed out (1000ms)`，宿主不阻塞 |
+| 命名组 / 编号组 | find 输出 `groups: {name: value}` 与 `captures: [...]`；replace 支持 `$<name>`/`$n` |
 | 零匹配 | find 返回 `[]`；replace 返回原文本 + `replaced: 0` |
-| 输入超 64KB | `regex: input exceeds 64000 bytes`（入口拒绝） |
+| 输入超 64KB / pattern 超 16KB / replacement 超 16KB | 入口拒绝（不截断） |
+| 输出超 1MB（替换放大如 `$`` / `$'`） | `regex: result/output exceeds 1000000 bytes`，拒绝而非截断 |
+| find limit | 默认 50，钳制到 1,000（防输出膨胀） |
+| explain 节点超 4,096 | `regex: explain: pattern too complex` |
 | `$` 引用 | 走 JS 原生字符串替换路径：`$$`→`$`、`$n`→组（未参与→空串）、`$<name>`→命名组、未知引用字面保留（`$0`/`$<foo>` 与 V8 一致） |
 
 ## 接入方式

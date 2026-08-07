@@ -9,6 +9,8 @@
  * \d \w \s \b 等 → 交替 | → 其余字面量。
  */
 
+import { MAX_EXPLAIN_NODES, MAX_PATTERN_BYTES } from './engine.ts'
+
 export interface ExplainNode {
   kind: 'literal' | 'class' | 'group' | 'quantifier' | 'anchor' | 'alternation' | 'escape'
   /** 原始切片（含定界符）。 */
@@ -88,9 +90,19 @@ export function explainPattern(pattern: unknown): ExplainNode[] {
   if (typeof pattern !== 'string') {
     throw new Error('regex: pattern must be a string')
   }
+  if (Buffer.byteLength(pattern, 'utf8') > MAX_PATTERN_BYTES) {
+    throw new Error(`regex: pattern exceeds ${MAX_PATTERN_BYTES} bytes`)
+  }
   const nodes: ExplainNode[] = []
   let i = 0
   const len = pattern.length
+
+  const push = (node: ExplainNode): void => {
+    if (nodes.length >= MAX_EXPLAIN_NODES) {
+      throw new Error(`regex: explain: pattern too complex (more than ${MAX_EXPLAIN_NODES} nodes)`)
+    }
+    nodes.push(node)
+  }
 
   while (i < len) {
     const ch = pattern[i]!
@@ -100,7 +112,7 @@ export function explainPattern(pattern: unknown): ExplainNode[] {
     if (ch === '\\') {
       const esc = pattern[i + 1]
       if (esc === undefined) {
-        nodes.push({ kind: 'escape', text: '\\', meaning: 'Lone backslash (trailing)' })
+        push({ kind: 'escape', text: '\\', meaning: 'Lone backslash (trailing)' })
         break
       }
       let text = `\\${esc}`
@@ -119,7 +131,7 @@ export function explainPattern(pattern: unknown): ExplainNode[] {
       } else {
         i += 2
       }
-      nodes.push({ kind: 'escape', text, meaning })
+      push({ kind: 'escape', text, meaning })
       continue
     }
 
@@ -132,7 +144,7 @@ export function explainPattern(pattern: unknown): ExplainNode[] {
       const inner = pattern.slice(i + 1, end)
       const negated = inner.startsWith('^')
       const display = truncate(negated ? inner.slice(1) : inner)
-      nodes.push({
+      push({
         kind: 'class',
         text: pattern.slice(i, end + 1),
         meaning: negated
@@ -176,7 +188,7 @@ export function explainPattern(pattern: unknown): ExplainNode[] {
       if (end === -1) {
         throw new Error(`regex: explain: unmatched "(" at position ${pos}`)
       }
-      nodes.push({ kind: 'group', text: pattern.slice(i, end + 1), meaning: kind })
+      push({ kind: 'group', text: pattern.slice(i, end + 1), meaning: kind })
       i = end + 1
       continue
     }
@@ -192,7 +204,7 @@ export function explainPattern(pattern: unknown): ExplainNode[] {
       let text = ch
       if (pattern[i + 1] === '?') { text += '?'; lazy = true; i++ }
       const base = ch === '*' ? '0 or more' : ch === '+' ? '1 or more' : '0 or 1'
-      nodes.push({
+      push({
         kind: 'quantifier',
         text,
         meaning: `Quantifier: previous item ${base} times (${lazy ? 'lazy' : 'greedy'})`,
@@ -214,7 +226,7 @@ export function explainPattern(pattern: unknown): ExplainNode[] {
           : m[3] == null // V8: (\d*)? 空匹配为 null
             ? `${n} or more times`
             : `between ${n} and ${m[3]} times`
-        nodes.push({
+        push({
           kind: 'quantifier',
           text,
           meaning: `Quantifier: previous item ${spec} (${lazy ? 'lazy' : 'greedy'})`,
@@ -222,35 +234,35 @@ export function explainPattern(pattern: unknown): ExplainNode[] {
         i += text.length
         continue
       }
-      nodes.push({ kind: 'literal', text: '{', meaning: 'Literal "{"' })
+      push({ kind: 'literal', text: '{', meaning: 'Literal "{"' })
       i++
       continue
     }
 
     // ── 锚点 / 交替 / 任意字符 ──
     if (ch === '^') {
-      nodes.push({ kind: 'anchor', text: '^', meaning: 'Start anchor: matches at the beginning (with m flag, after any line break)' })
+      push({ kind: 'anchor', text: '^', meaning: 'Start anchor: matches at the beginning (with m flag, after any line break)' })
       i++
       continue
     }
     if (ch === '$') {
-      nodes.push({ kind: 'anchor', text: '$', meaning: 'End anchor: matches at the end (with m flag, before any line break)' })
+      push({ kind: 'anchor', text: '$', meaning: 'End anchor: matches at the end (with m flag, before any line break)' })
       i++
       continue
     }
     if (ch === '|') {
-      nodes.push({ kind: 'alternation', text: '|', meaning: 'Alternation: match either the left or the right side' })
+      push({ kind: 'alternation', text: '|', meaning: 'Alternation: match either the left or the right side' })
       i++
       continue
     }
     if (ch === '.') {
-      nodes.push({ kind: 'literal', text: '.', meaning: 'Any character except line terminators' })
+      push({ kind: 'literal', text: '.', meaning: 'Any character except line terminators' })
       i++
       continue
     }
 
     // ── 其余字面量 ──
-    nodes.push({ kind: 'literal', text: ch, meaning: `Literal ${JSON.stringify(ch)}` })
+    push({ kind: 'literal', text: ch, meaning: `Literal ${JSON.stringify(ch)}` })
     i++
   }
 

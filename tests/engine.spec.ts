@@ -1,10 +1,14 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Worker } from 'node:worker_threads'
 import {
   compilePattern, assertInputSize, testMatch, findAll, replaceAll,
-  MAX_INPUT_BYTES,
+  normalizeLimit, executeAction,
+  MAX_INPUT_BYTES, MAX_PATTERN_BYTES, MAX_REPLACEMENT_BYTES, MAX_MATCHES,
 } from '../src/engine.ts'
 import { explainPattern } from '../src/explain.ts'
+
+vi.mock('@deepseek-ai/dsh-tools', () => ({ defineTool: (opts: unknown) => opts }))
+import { apply } from '../src/index.ts'
 
 describe('compilePattern', () => {
   it('compiles a plain pattern', () => {
@@ -47,6 +51,12 @@ describe('compilePattern', () => {
 
   it('rejects non-string patterns', () => {
     expect(() => compilePattern(42 as unknown as string, '')).toThrow('regex: pattern must be a string')
+  })
+
+  it(`rejects patterns over ${MAX_PATTERN_BYTES} bytes (R-05)`, () => {
+    expect(() => compilePattern('a'.repeat(MAX_PATTERN_BYTES + 1), ''))
+      .toThrow(`regex: pattern exceeds ${MAX_PATTERN_BYTES} bytes`)
+    expect(() => compilePattern('a'.repeat(MAX_PATTERN_BYTES), '')).not.toThrow()
   })
 })
 
@@ -91,25 +101,31 @@ describe('findAll', () => {
 
   it('collects all matches with indexes', () => {
     expect(findAll(re('a+'), 'baaac', 50)).toEqual([
-      { index: 1, match: 'aaa', groups: null },
+      { index: 1, match: 'aaa', captures: [], groups: null },
     ])
     expect(findAll(re('a'), 'abac', 50)).toEqual([
-      { index: 0, match: 'a', groups: null },
-      { index: 2, match: 'a', groups: null },
+      { index: 0, match: 'a', captures: [], groups: null },
+      { index: 2, match: 'a', captures: [], groups: null },
     ])
   })
 
-  it('exposes capture groups', () => {
+  it('exposes numbered capture groups (R-06)', () => {
     const r = findAll(re('(\\w+)@(\\w+)'), 'a@b x c@d', 50)
     expect(r).toEqual([
-      { index: 0, match: 'a@b', groups: null },
-      { index: 6, match: 'c@d', groups: null },
+      { index: 0, match: 'a@b', captures: ['a', 'b'], groups: null },
+      { index: 6, match: 'c@d', captures: ['c', 'd'], groups: null },
     ])
   })
 
-  it('exposes named groups', () => {
+  it('exposes named groups alongside numbered captures', () => {
     const r = findAll(re('(?<name>\\w+)@(\\w+)'), 'a@b', 50)
+    expect(r[0]?.captures).toEqual(['a', 'b'])
     expect(r[0]?.groups).toEqual({ name: 'a' })
+  })
+
+  it('keeps non-participating captures as undefined', () => {
+    const r = findAll(re('(a)?(b)'), 'b', 50)
+    expect(r[0]?.captures).toEqual([undefined, 'b'])
   })
 
   it('returns an empty array on zero matches', () => {
@@ -123,9 +139,9 @@ describe('findAll', () => {
   it('advances past empty matches without an infinite loop', () => {
     const r = findAll(re('x*'), 'ab', 50)
     expect(r).toEqual([
-      { index: 0, match: '', groups: null },
-      { index: 1, match: '', groups: null },
-      { index: 2, match: '', groups: null },
+      { index: 0, match: '', captures: [], groups: null },
+      { index: 1, match: '', captures: [], groups: null },
+      { index: 2, match: '', captures: [], groups: null },
     ])
   })
 
@@ -133,6 +149,22 @@ describe('findAll', () => {
     // forceGlobal 是 find 的入口行为；这里验证产物确实带 g
     expect(re('\\w+').flags).toContain('g')
     expect(findAll(re('\\w+'), 'one two', 50)).toHaveLength(2)
+  })
+
+  it('advances past empty matches by code point under u/v flags (R-02)', () => {
+    // '😀' 占 2 个 UTF-16 code unit；u 模式下推进必须跨过整个 surrogate pair
+    expect(findAll(re('', 'u'), '😀', 10).map(m => m.index)).toEqual([0, 2])
+    expect(findAll(re('', 'v'), '😀', 10).map(m => m.index)).toEqual([0, 2])
+    expect(findAll(re('x*', 'u'), '😀', 10).map(m => m.index)).toEqual([0, 2])
+    expect(findAll(re('', 'u'), 'a😀b', 10).map(m => m.index)).toEqual([0, 1, 3, 4])
+    // 非 Unicode 模式按 code unit 推进（'😀' 2 个 code unit → 位置 0,1,2）
+    expect(findAll(re(''), '😀', 10).map(m => m.index)).toEqual([0, 1, 2])
+  })
+
+  it(`clamps limit to MAX_MATCHES (R-03)`, () => {
+    expect(normalizeLimit(1e9)).toBe(MAX_MATCHES)
+    expect(normalizeLimit(Number.POSITIVE_INFINITY)).toBe(50)
+    expect(findAll(re('a'), 'a'.repeat(2000), 1e9)).toHaveLength(MAX_MATCHES)
   })
 })
 
@@ -179,9 +211,87 @@ describe('replaceAll', () => {
   it('rejects a non-string replacement', () => {
     expect(() => replaceAll(re('a'), 'a', 42 as unknown as string)).toThrow('regex: replacement must be a string')
   })
+
+  it(`rejects replacements over ${MAX_REPLACEMENT_BYTES} bytes (R-04)`, () => {
+    expect(() => replaceAll(re('a'), 'a', 'x'.repeat(MAX_REPLACEMENT_BYTES + 1)))
+      .toThrow(`regex: replacement exceeds ${MAX_REPLACEMENT_BYTES} bytes`)
+  })
+
+  it('rejects results over the output budget (R-04 amplification)', () => {
+    // 3000 次匹配 × 500 字节替换 ≈ 1.5MB > 1MB 输出预算
+    expect(() => replaceAll(re('a'), 'a'.repeat(3000), 'x'.repeat(500)))
+      .toThrow('regex: result exceeds 1000000 bytes')
+  })
+
+  it('counts empty matches by code point under u flags (R-02)', () => {
+    expect(replaceAll(re('', 'u'), '😀', '-')).toEqual({ result: '-😀-', replaced: 2 })
+  })
 })
 
-// ── ReDoS 测试（§6.2）──
+describe('executeAction（动作分发 + 统一输出预算）', () => {
+  it('explain output respects the output budget (R-05)', () => {
+    // 16KB pattern 内、节点数超限：报错而非生成巨量 JSON
+    expect(() => executeAction({ action: 'explain', pattern: 'a'.repeat(5000) }))
+      .toThrow(/pattern too complex/)
+  })
+
+  it('throws on unknown actions', () => {
+    expect(() => executeAction({ action: 'bogus', pattern: 'a', input: 'x' }))
+      .toThrow('regex: unknown action "bogus"')
+  })
+
+  it('returns JSON text for all actions', () => {
+    expect(executeAction({ action: 'test', pattern: '\\d+', input: 'abc123' })).toBe('{"matched":true}')
+    expect(executeAction({ action: 'find', pattern: 'a', input: 'aba' })).toBe('[{"index":0,"match":"a","captures":[],"groups":null},{"index":2,"match":"a","captures":[],"groups":null}]')
+    expect(executeAction({ action: 'replace', pattern: 'a', input: 'aba', replacement: 'X' })).toBe('{"result":"XbX","replaced":2}')
+    expect(executeAction({ action: 'explain', pattern: '^a$' })).toContain('"kind":"anchor"')
+  })
+})
+
+describe('explainPattern 资源上限（R-05）', () => {
+  it(`rejects patterns over ${MAX_PATTERN_BYTES} bytes`, () => {
+    expect(() => explainPattern('a'.repeat(MAX_PATTERN_BYTES + 1)))
+      .toThrow(`regex: pattern exceeds ${MAX_PATTERN_BYTES} bytes`)
+  })
+
+  it('rejects overly complex patterns (node cap)', () => {
+    expect(() => explainPattern('a'.repeat(5000)))
+      .toThrow(/pattern too complex \(more than 4096 nodes\)/)
+    expect(explainPattern('a'.repeat(100))).toHaveLength(100)
+  })
+})
+
+// ── R-01：worker 硬超时（关键回归）──
+
+describe('R-01: worker 硬超时（宿主不被同步回溯阻塞）', () => {
+  it('pathological regex is interrupted at the budget; host event loop stays responsive', async () => {
+    let captured: unknown
+    const ctx: any = { tools: { register: (def: unknown) => { captured = def; return () => {} } } }
+    apply(ctx)
+    const def = captured as any
+    const t0 = Date.now()
+    const tick = new Promise<string>(res => setTimeout(() => res('ticked'), 150))
+    const [outcome, ticked] = await Promise.all([
+      def.execute({ action: 'test', pattern: '(a+)+$', input: 'a'.repeat(40_000) + 'b' })
+        .catch((e: Error) => `ERR: ${e.message}`),
+      tick,
+    ])
+    expect(ticked).toBe('ticked') // 宿主事件循环未被正则阻塞
+    expect(outcome).toMatch(/execution timed out/)
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(950)
+  }, 10_000)
+
+  it('normal executions still work through the worker path', async () => {
+    let captured: unknown
+    const ctx: any = { tools: { register: (def: unknown) => { captured = def; return () => {} } } }
+    apply(ctx)
+    const def = captured as any
+    const out = await def.execute({ action: 'find', pattern: '(\\w+)@(\\w+)', input: 'a@b' })
+    expect(JSON.parse(out)).toEqual([{ index: 0, match: 'a@b', captures: ['a', 'b'], groups: null }])
+  }, 10_000)
+})
+
+// ── ReDoS 基础防护（§6.2 保留）──
 
 /** 在可终止的 worker 里运行任意同步代码；预算内未完成则 terminate（不挂死测试进程）。 */
 function runInKillableWorker(code: string, budgetMs: number): Promise<'completed' | 'terminated'> {
@@ -199,7 +309,7 @@ function runInKillableWorker(code: string, budgetMs: number): Promise<'completed
   })
 }
 
-describe('ReDoS 防护（§6.2：预算内返回或被取消，不挂死测试进程）', () => {
+describe('ReDoS 原始行为（V8 层验证）', () => {
   it('pathological pattern (a+)+$ on 40KB input is cancelled within budget', async () => {
     const code = `
       const { parentPort } = require('node:worker_threads')
@@ -215,11 +325,6 @@ describe('ReDoS 防护（§6.2：预算内返回或被取消，不挂死测试�
     expect(['completed', 'terminated']).toContain(outcome)
     expect(elapsed).toBeLessThan(10_000)
   }, 15_000)
-
-  it('the 64KB entry cap rejects the same pattern before any execution', () => {
-    // 引擎入口先于正则执行拒绝超限输入——这是最可靠的防线，同步且可测
-    expect(() => assertInputSize('a'.repeat(MAX_INPUT_BYTES + 1))).toThrow()
-  })
 
   it('a safe pattern on a 40KB input completes quickly in-process', () => {
     const input = 'a'.repeat(40_000) + 'b'

@@ -15,7 +15,7 @@
  * - explain 只做静态 tokenizer，不构造 RegExp，天然免疫 ReDoS，保持同步执行。
  */
 
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { Worker } from 'node:worker_threads'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { executeAction, type RegexActionArgs } from './engine.ts'
@@ -59,8 +59,9 @@ function executeInWorker(args: RegexActionArgs): Promise<string> {
         else reject(new Error(msg.error ?? 'regex: worker failed'))
       })
     })
-    worker.once('error', (err) => {
-      settle(() => reject(new Error(`regex: worker error: ${err.message}`)))
+    worker.once('error', (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err)
+      settle(() => reject(new Error(`regex: worker error: ${message}`)))
     })
     worker.once('exit', (code) => {
       // 仅在未收到响应时可达（正常路径已由 message 处理 settle）；视为失败

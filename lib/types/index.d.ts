@@ -14,7 +14,7 @@
  *   （worker 内再次校验）。
  * - explain 只做静态 tokenizer，不构造 RegExp，天然免疫 ReDoS，保持同步执行。
  */
-import type { Context } from 'cordis';
+import type { Context } from '@deepseek-ai/cordis';
 export declare const name = "@deepseek-ai/dsh-tool-regex";
 export declare const inject: string[];
 export declare function apply(ctx: Context): void;

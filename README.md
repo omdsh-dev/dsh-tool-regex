@@ -1,5 +1,7 @@
 # dsh-tool-regex
 
+[English](README.en.md)
+
 DSH 正则工具插件 —— 测试匹配、提取捕获组、安全替换、**静态解释正则含义（不执行任何代码）**。零依赖、纯函数。
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
